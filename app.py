@@ -1,63 +1,102 @@
-from flask import Flask, request, jsonify, render_template
-import os
-from documents import process_docx, process_pdf, process_txt
-from indexing import index_document
-from querying import query_documents
-import preprocess
+import streamlit as st
+from memory_manager import store_message, retrieve_messages
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from document_loader import load_and_chunk_documents
+from qdrant_helper import index_document, query_qdrant
+from rag import generate_answer
 
-app = Flask(__name__)
+SESSION_ID = "user_session"
+COLLECTION_NAME = "document_chunks"
 
-UPLOAD_FOLDER = 'uploads'
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+# Initialize session state if not present
+if "messages" not in st.session_state:
+    st.session_state.messages = retrieve_messages(SESSION_ID)
 
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+if "last_retrieved_chunks" not in st.session_state:
+    st.session_state.last_retrieved_chunks = []
 
-# Route to render index.html (upload page)
-@app.route('/')
-def index():
-    return render_template('index.html')  # Serves the HTML form
+# Add sidebar for document upload
+st.sidebar.header("Upload Documents")
+uploaded_files = st.sidebar.file_uploader(
+    "Choose your documents (PDF, DOCX, TXT)", 
+    type=["pdf", "docx", "txt"], 
+    accept_multiple_files=True
+)
 
-@app.route('/upload', methods=['POST'])
-def upload_file():
-    file = request.files.get('file')
-    if not file:
-        return jsonify({"error": "No file uploaded"}), 400
-        
-    file_path = os.path.join(app.config['UPLOAD_FOLDER'], file.filename)
-    file.save(file_path)
-    
-    # Process file into structured chunks
-    if file.filename.endswith('.docx'):
-        chunks = process_docx(file_path)
-    elif file.filename.endswith('.pdf'):
-        chunks = process_pdf(file_path)
-    elif file.filename.endswith('.txt'):
-        chunks = process_txt(file_path)
+# Handle file uploads
+if uploaded_files:
+    for uploaded_file in uploaded_files:
+        st.sidebar.write(f"**{uploaded_file.name}**")
+        if st.sidebar.button(f"Upload {uploaded_file.name}"):
+            file_path = f"uploads/{uploaded_file.name}"
+            with open(file_path, "wb") as f:
+                f.write(uploaded_file.getbuffer())
+            st.sidebar.write(f"✅ Saved {uploaded_file.name}")
+            chunks = load_and_chunk_documents(file_path)
+            response = index_document(COLLECTION_NAME, uploaded_file.name, chunks)
+            if response["status"] == "success":
+                st.sidebar.success(f"Indexed {len(chunks)} chunks for {uploaded_file.name}")
+            else:
+                st.sidebar.error(f"Failed to index {uploaded_file.name}: {response['message']}")
+
+# Left sidebar for showing sources
+with st.sidebar:
+    st.header("Sources")
+    if st.session_state.last_retrieved_chunks:
+        for i, chunk in enumerate(st.session_state.last_retrieved_chunks):
+            source = chunk["metadata"].get("source", "Unknown Source")
+            score = chunk.get("score", "N/A")
+            with st.expander(f"Source {i+1} (Score: {score:.2f}) - {source}"):
+                st.write(chunk["text"])
     else:
-        return jsonify({"error": "Unsupported file type"}), 400
-        
-    # Now chunks contain section and subsection information
-    # We don't need to join them into full_text anymore
-    result = index_document("documents", file.filename, chunks)
-    
-    return jsonify(result)
+        st.write("No sources to display. Ask a question to see relevant sources.")
 
-@app.route('/query', methods=['POST'])
-def query():
-    try:
-        print("Entering query route")
-        query_text = request.json.get('query')
-        
-        if not query_text:
-            return jsonify({"error": "Query cannot be empty"}), 400
+# Collapsible Chat History
+with st.sidebar:
+    st.header("Chat History")
+    if st.button("Show Chat History"):
+        with st.expander("Chat History", expanded=True):
+            for message in st.session_state.messages:
+                if isinstance(message, HumanMessage):
+                    st.markdown(f"**User:** {message.content}")
+                elif isinstance(message, AIMessage):
+                    st.markdown(f"**Assistant:** {message.content}")
+
+# Chat input for user query
+query = st.chat_input("Ask a question about your documents...")
+
+if query:
+    st.session_state.messages.append(HumanMessage(content=query))
+    store_message(SESSION_ID, query, "user")
+    
+    with st.chat_message("user"):
+        st.write(query)
+    
+    with st.chat_message("assistant"):
+        with st.spinner("Thinking..."):
+            retrieved_chunks = query_qdrant(COLLECTION_NAME, query)
             
-        score_threshold = request.json.get('score_threshold', 0.5)
-        results = query_documents("documents", query_text, score_threshold=score_threshold)
-       # print(results)
-        return jsonify(results)
-        
-    except Exception as e:
-        print(f"Error in query route: {str(e)}")  # Debug log
-        return jsonify({"error": f"Query processing failed: {str(e)}"}), 500
-if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+            if retrieved_chunks:
+                st.session_state.last_retrieved_chunks = retrieved_chunks  # Store for sidebar
+                contexts = [chunk["text"] for chunk in retrieved_chunks]
+                combined_context = " ".join(contexts)
+                answer = generate_answer(query, combined_context)
+                
+                context_message = SystemMessage(content=f"Use the following context to answer the question:\n{combined_context}")
+                st.session_state.messages.append(context_message)
+                st.session_state.messages.append(AIMessage(content=answer))
+                st.write(answer)
+                store_message(SESSION_ID, answer, "assistant")
+            
+            else:
+                no_info_msg = "I don't have enough information to answer that question. Please try a different question or upload relevant documents."
+                st.write(no_info_msg)
+                st.session_state.messages.append(AIMessage(content=no_info_msg))
+                store_message(SESSION_ID, no_info_msg, "assistant")
+
+# Button to clear chat history and sources
+if st.button("Clear Chat History"):
+    st.session_state.messages = [
+        SystemMessage(content="I am a helpful AI assistant that can answer questions about your documents.")
+    ]
+    st.session_state.last_retrieved_chunks = []  # Clear sources
